@@ -49,10 +49,67 @@ app.get('/api/audit',async()=>audit.slice(-100));
 const priorityRequests:any[]=[]; const corridors:any[]=[{id:'C-01',name:'中山路绿波走廊',intersectionIds:['J-01','J-02','J-03'],lengthMeters:2400,targetSpeedKph:36}]; const scenarioPolicies:any[]=[];
 app.get('/api/corridors',async()=>corridors);
 app.post('/api/corridors/:id/coordinate',async(req:any,res)=>{const c=corridors.find(x=>x.id===(req.params as any).id);if(!c)return res.code(404).send({error:'corridor not found'});const b=req.body as any;const speedKph=Number(b.speedKph||c.targetSpeedKph);if(speedKph<10||speedKph>70)return res.code(400).send({error:'speedKph must be 10-70'});const cycle=Math.max(...c.intersectionIds.map((id:string)=>intersections.find(x=>x.id===id)?.cycle||60));const offsets:any={};let distanceSeconds=0;for(const id of c.intersectionIds){const j=intersections.find(x=>x.id===id)!;distanceSeconds+=c.lengthMeters/c.intersectionIds.length/(speedKph/3.6);offsets[id]=Math.round(distanceSeconds%cycle);j.offset=offsets[id];}const plan={id:randomUUID(),corridorId:c.id,cycleSeconds:cycle,speedKph,offsets,createdAt:now(),status:'coordinated'};plans.push(plan);log('corridor.coordinate',plan);return plan;});
-app.post('/api/priority-requests',async(req:any,res)=>{const b=req.body as any;if(!b.intersectionId||!b.routeId||b.etaSeconds==null)return res.code(400).send({error:'intersectionId、routeId、etaSeconds 必填'});const j=intersections.find(x=>x.id===b.intersectionId);if(!j)return res.code(404).send({error:'intersection not found'});const r={id:randomUUID(),intersectionId:b.intersectionId,routeId:b.routeId,etaSeconds:Number(b.etaSeconds),passengers:Number(b.passengers||0),requestType:b.requestType||'transit',status:'requested',requestedAt:now()};r.approved=r.passengers>=20||r.requestType==='emergency';r.status=r.approved?'approved':'deferred';priorityRequests.push(r);log('priority.request',r);return r;});
+// Explainable priority decision flow: couples /api/priority-requests with /api/pedestrian-phase.
+type PriorityRequestType='transit'|'emergency';
+type PriorityDecisionStatus='approved'|'deferred'|'denied';
+type PriorityReasonCode='DUPLICATE_REQUEST'|'ETA_EXPIRED'|'PEDESTRIAN_CLEARANCE_CONFLICT'|'EMERGENCY_PREEMPTION'|'HIGH_OCCUPANCY'|'LOW_OCCUPANCY_DEFERRAL';
+const TRANSIT_APPROVAL_PASSENGERS=20;
+const OPEN_PRIORITY_STATUSES:PriorityDecisionStatus[]=['approved','deferred'];
+function latestPedestrianPolicy(intersectionId:string):any{
+ const matching=scenarioPolicies.filter((p:any)=>p.intersectionId===intersectionId&&p.status==='validated');
+ return matching.length?matching[matching.length-1]:null;
+}
+function evaluatePriorityRequest(input:{intersectionId:string;routeId:string;requestType:PriorityRequestType;etaSeconds:number;passengers:number},existing:any[]):{status:PriorityDecisionStatus;reasonCode:PriorityReasonCode;reason:string;factors:Record<string,any>}{
+ const factors:Record<string,any>={requestType:input.requestType,passengers:input.passengers,etaSeconds:input.etaSeconds,thresholds:{transitApprovalPassengers:TRANSIT_APPROVAL_PASSENGERS}};
+ const duplicate=existing.find((x:any)=>x.intersectionId===input.intersectionId&&x.routeId===input.routeId&&x.requestType===input.requestType&&OPEN_PRIORITY_STATUSES.includes(x.status));
+ if(duplicate){
+  factors.duplicateOf=duplicate.id; factors.duplicateStatus=duplicate.status;
+  return {status:'denied',reasonCode:'DUPLICATE_REQUEST',reason:`该路线在路口 ${input.intersectionId} 已有未终结的${duplicate.status==='approved'?'已批准':'已延后'}请求 ${duplicate.id}，请勿重复提交`,factors};
+ }
+ if(input.etaSeconds<=0){
+  return {status:'denied',reasonCode:'ETA_EXPIRED',reason:`ETA=${input.etaSeconds}s 已过期，车辆应已通过或无法到达路口，不予优先`,factors};
+ }
+ const policy=latestPedestrianPolicy(input.intersectionId);
+ if(!policy){
+  factors.pedestrianPolicyId=null; factors.requiredClearanceSeconds=0; factors.note='该路口暂无行人过街策略，不施加行人安全清空约束';
+ }else{
+  const requiredClearance=Number(policy.crossingSeconds)+Number(policy.leadingInterval||0);
+  factors.pedestrianPolicyId=policy.id; factors.requiredClearanceSeconds=requiredClearance; factors.etaAllowsPedestrianClearance=input.etaSeconds>=requiredClearance;
+  if(input.etaSeconds<requiredClearance){
+   factors.policyLeadingInterval=Number(policy.leadingInterval||0); factors.policyCrossingSeconds=Number(policy.crossingSeconds);
+   const retry=requiredClearance-input.etaSeconds;
+   if(input.requestType==='emergency'){
+    return {status:'deferred',reasonCode:'PEDESTRIAN_CLEARANCE_CONFLICT',reason:`应急请求与行人安全清空冲突：ETA ${input.etaSeconds}s 小于行人最小清空时间 ${requiredClearance}s（过街 ${policy.crossingSeconds}s + 先行间隔 ${policy.leadingInterval||0}s），延后至行人清空后放行，预计 ${retry}s 后可批准`,factors:{...factors,retryAfterSeconds:retry}};
+   }
+   return {status:'denied',reasonCode:'PEDESTRIAN_CLEARANCE_CONFLICT',reason:`ETA ${input.etaSeconds}s 小于行人最小清空时间 ${requiredClearance}s（过街 ${policy.crossingSeconds}s + 先行间隔 ${policy.leadingInterval||0}s），批准会截断行人过街，拒绝本周期优先请求`,factors:{...factors,retryAfterSeconds:retry}};
+  }
+ }
+ if(input.requestType==='emergency'){
+  return {status:'approved',reasonCode:'EMERGENCY_PREEMPTION',reason:`应急车辆优先抢占（ETA ${input.etaSeconds}s 满足行人安全清空时间 ${factors.requiredClearanceSeconds||0}s）`,factors};
+ }
+ if(input.passengers>=TRANSIT_APPROVAL_PASSENGERS){
+  return {status:'approved',reasonCode:'HIGH_OCCUPANCY',reason:`公交通勤大客流批准：乘客 ${input.passengers} 人 >= ${TRANSIT_APPROVAL_PASSENGERS} 人阈值，且行人安全清空时间已满足`,factors};
+ }
+ return {status:'deferred',reasonCode:'LOW_OCCUPANCY_DEFERRAL',reason:`普通低客流请求维持既有延后行为：乘客 ${input.passengers} 人 < ${TRANSIT_APPROVAL_PASSENGERS} 人阈值，排入下一周期评估`,factors};
+}
+app.post('/api/priority-requests',async(req:any,res)=>{
+ const b=req.body as any;
+ if(!b.intersectionId||!b.routeId||b.etaSeconds==null)return res.code(400).send({error:'intersectionId、routeId、etaSeconds 必填'});
+ const j=intersections.find(x=>x.id===b.intersectionId);
+ if(!j)return res.code(404).send({error:'intersection not found'});
+ let requestType:PriorityRequestType='transit';
+ if(b.requestType!=null)requestType=String(b.requestType) as PriorityRequestType;
+ if(requestType!=='transit'&&requestType!=='emergency')return res.code(400).send({error:"requestType 仅支持 transit 或 emergency"});
+ const etaSeconds=Number(b.etaSeconds);
+ if(!Number.isFinite(etaSeconds))return res.code(400).send({error:'etaSeconds 必须为数字（秒）'});
+ const passengers=Number(b.passengers)||0;
+ const decision=evaluatePriorityRequest({intersectionId:b.intersectionId,routeId:String(b.routeId),requestType,etaSeconds,passengers},priorityRequests);
+ const r={id:randomUUID(),intersectionId:b.intersectionId,routeId:String(b.routeId),etaSeconds,passengers,requestType,status:decision.status,approved:decision.status==='approved',reasonCode:decision.reasonCode,reason:decision.reason,factors:decision.factors,requestedAt:now()};
+ priorityRequests.push(r);log('priority.request',r);return r;
+});
 app.post('/api/pedestrian-phase',async(req:any,res)=>{const b=req.body as any;if(!b.intersectionId||b.crossingSeconds==null)return res.code(400).send({error:'intersectionId 和 crossingSeconds 必填'});const crossing=Number(b.crossingSeconds);if(crossing<7||crossing>60)return res.code(400).send({error:'crossingSeconds must be 7-60'});const j=intersections.find(x=>x.id===b.intersectionId);if(!j)return res.code(404).send({error:'intersection not found'});const p={id:randomUUID(),intersectionId:j.id,crossingSeconds:crossing,leadingInterval:Number(b.leadingInterval||3),accessible:Boolean(b.accessible),status:'validated',createdAt:now()};scenarioPolicies.push(p);return p;});
 app.post('/api/simulations/:id/emissions',async(req:any,res)=>{const r=runs.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'simulation not found'});const vkt=Number((req.body as any)?.vehicleKm||12000);const stopPenalty=(r.candidate?.totalDelay??r.baseline.totalDelay)/Math.max(1,r.baseline.horizon);return{simulationId:r.id,vehicleKm:vkt,co2Kg:Number((vkt*(.142+stopPenalty*.0008)).toFixed(2)),noxGrams:Number((vkt*(.32+stopPenalty*.0015)).toFixed(2)),idleHours:Number((stopPenalty*vkt/3600).toFixed(2)),method:'speed-delay surrogate model'};});
 app.post('/api/evacuation-scenarios',async(req:any)=>{const b=req.body as any;const blocked=(b.blockedIntersections||[]) as string[];const original=incidents.length;for(const id of blocked)incidents.push({id:randomUUID(),intersectionId:id,type:'evacuation-block',severity:'high',status:'active',startedAt:now()});const result=simulate({horizon:b.horizon||1800,demand:b.demand});incidents.splice(original);return{id:randomUUID(),type:'evacuation',blockedIntersections:blocked,result,recommendation:result.spillbacks>3?'open reversible lanes and meter upstream inflow':'maintain coordinated offsets'};});
-app.get('/api/priority-requests',async()=>priorityRequests);
+app.get('/api/priority-requests',async(req:any)=>{const q=req.query as any;let result=priorityRequests.slice();if(q.status)result=result.filter(x=>x.status===q.status);if(q.intersectionId)result=result.filter(x=>x.intersectionId===q.intersectionId);if(q.routeId)result=result.filter(x=>x.routeId===String(q.routeId));const counts={total:result.length,approved:result.filter((x:any)=>x.status==='approved').length,deferred:result.filter((x:any)=>x.status==='deferred').length,denied:result.filter((x:any)=>x.status==='denied').length};return{requests:result,counts,decisionsByReason:Object.fromEntries([...new Set(result.map((x:any)=>x.reasonCode))].filter(Boolean).map((code:any)=>[code,result.filter((x:any)=>x.reasonCode===code).length]))};});
 
 app.listen({port:Number(process.env.PORT||6302),host:'127.0.0.1'}).catch(err=>{app.log.error(err);process.exit(1)});
